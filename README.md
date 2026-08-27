@@ -6,15 +6,15 @@ Claude Code / Cursor skill: ежедневный анализ лидов Bitrix2
 
 | Файл | Зачем |
 |------|--------|
-| `SKILL.md` | Основной скилл (группы A/B/C, шаги 4A–8, отчёт в chat31598) |
+| `SKILL.md` | Основной скилл: день отчёта = вчера МСК; A/B/C; отчёт покрытие→автоматизация→к действию→UF-gap |
 | `references/field_rules.md` | Правила полей CRM, включая **ТегиКЦ** |
 | `references/doctor_names.md` | Справочник врачей (R05) |
 | `references/feedback_form_url.md` | Архив: Google-форма выведена; канал — бот в chat31598 |
 
 ## Архитектура
 
-1. **Фаза 1** (DWH, `dwh-etl`): `lead_analysis_fetch.py` → JSON батчи `latest/`
-2. **Фаза 2** (этот скилл): суждение по батчам → CRM + отчёт + CSV
+1. **Фаза 1** (DWH, `dwh-etl`): `lead_analysis_fetch.py --report-date=yesterday` → JSON `latest/`
+2. **Фаза 2** (этот скилл): суждение по батчам → CRM + отчёт (без карточек чистого UF-gap) + CSV
 
 Фаза 2 **не** на DWH в РФ (Claude/OAuth). Рантаймы: Cursor / Automations, GCP VM (v2).
 
