@@ -1,1 +1,2 @@
 requests>=2.31,<3
+playwright>=1.45,<2  # только для scripts/gap_transcript_pass.py (дорасшифровка UF-gap)

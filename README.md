@@ -14,6 +14,7 @@
 | `references/doctor_names.md` | Справочник врачей (R05) |
 | `references/feedback_form_url.md` | Архив: Google-форма выведена; канал — бот в chat31598 |
 | `docs/CURSOR_AUTOMATION.md` | Настройка и тестовый прогон в Cursor Cloud |
+| `scripts/gap_transcript_pass.py` | Опционально, шаг 1.5: дорасшифровка через браузер только UF-gap лидов сегодняшнего отчёта, с дневным бюджетом и circuit-breaker по лимиту BitrixGPT — см. `docs/CURSOR_AUTOMATION.md` §5 |
 
 ## Архитектура
 
