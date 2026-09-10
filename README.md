@@ -8,8 +8,11 @@
 
 | Файл | Зачем |
 |------|--------|
-| `fetch.py` | Сбор фактов (фаза 1): лиды A/B/C за день отчёта, звонки, переписка, таймлайн, текст разговора |
-| `SKILL.md` | Правила суждения (фаза 2) и формат отчёта |
+| `fetch.py` | Сбор фактов: лиды A/B/C, звонки, переписка, таймлайн, текст разговора |
+| `triage.py` | Детерминированный триаж (R02/R06), auto-лиды без LLM, компактные `review/` |
+| `rules_core.py` | Общая логика правил для triage |
+| `SKILL.md` | Пайплайн агента, бюджет контекста, суждение по review-пакетам |
+| `references/report_format.md` | Шаблон отчёта в chat31598 |
 | `references/field_rules.md` | Правила полей CRM, включая **ТегиКЦ** |
 | `references/doctor_names.md` | Справочник врачей (R05) |
 | `references/feedback_form_url.md` | Архив: Google-форма выведена; канал — бот в chat31598 |
@@ -19,9 +22,12 @@
 ## Архитектура
 
 ```
-fetch.py --report-date=yesterday   →  .run/latest/{manifest,catalogs,batch_XX}.json
-агент по SKILL.md                  →  поля CRM + отчёт в chat31598 + leads_log.csv
+fetch.py  →  .run/latest/{manifest,catalogs,batch_XX}.json
+triage.py →  triage.json, auto_results.jsonl, review/review_NN.json
+агент     →  judgements.jsonl (только review-пакеты) → отчёт + CRM + CSV
 ```
+
+~50% лидов уходят в auto без LLM; агент **не читает** `batch_*.json` (экономия токенов).
 
 Всё в одном прогоне, на любой машине с доступом к порталу: Cursor Cloud, локальный Mac, VM.
 DWH в цепочке анализа не участвует.
@@ -36,10 +42,11 @@ pip install -r requirements.txt
 export BITRIX24_WEBHOOK_URL='https://laskov-partners.bitrix24.ru/rest/<id>/<code>/'
 
 python3 fetch.py --report-date=yesterday          # весь день
+python3 triage.py --in-dir .run/latest
 python3 fetch.py --report-date=yesterday --limit 5 --out-dir .run/smoke   # проба
 ```
 
-Дальше агент читает `SKILL.md` и разбирает батчи из `.run/latest`.
+Дальше агент по `SKILL.md`: только `review/review_*.json` → `judgements.jsonl`.
 
 ## Права вебхука
 
