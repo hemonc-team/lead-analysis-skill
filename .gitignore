@@ -4,3 +4,9 @@
 *.pem
 *.key
 credentials.json
+
+# Выгрузки фазы 1 содержат ПДн пациентов
+.run/
+logs/
+*.csv
+__pycache__/
