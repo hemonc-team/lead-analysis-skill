@@ -41,6 +41,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from rules_core import is_service_contact
+
 log = logging.getLogger("lead_analysis_fetch")
 if not logging.getLogger().handlers:
     logging.basicConfig(
@@ -403,13 +405,42 @@ def uf_gap_for_lead(calls: list[dict], uf_text: str) -> dict:
     }
 
 
-def fetch_contact_transcript(contact_id: int) -> str:
-    """UF транскрипта с контакта. Звонки часто висят на CONTACT, скилл читает лид."""
+_contact_meta_cache: dict[int, dict] = {}
+
+
+def fetch_contact_meta(contact_id: int) -> dict:
+    """Имя контакта + флаг сервисного агрегатора (ПроДокторов и т.п.)."""
+    cid = int(contact_id)
+    if cid in _contact_meta_cache:
+        return _contact_meta_cache[cid]
     data = bitrix_call(
         "crm.contact.get",
-        {"id": int(contact_id), "select": ["ID", UF_TRANSCRIPT]},
+        {
+            "id": cid,
+            "select": ["ID", "NAME", "SECOND_NAME", "LAST_NAME", UF_TRANSCRIPT],
+        },
     )
-    return str((data.get("result") or {}).get(UF_TRANSCRIPT) or "").strip()
+    row = data.get("result") or {}
+    name = str(row.get("NAME") or "").strip()
+    second_name = str(row.get("SECOND_NAME") or "").strip()
+    last_name = str(row.get("LAST_NAME") or "").strip()
+    svc, label = is_service_contact(name=name, second_name=second_name, last_name=last_name)
+    meta = {
+        "id": cid,
+        "name": name,
+        "second_name": second_name,
+        "last_name": last_name,
+        "is_service": svc,
+        "label": label if svc else None,
+        "transcript": str(row.get(UF_TRANSCRIPT) or "").strip(),
+    }
+    _contact_meta_cache[cid] = meta
+    return meta
+
+
+def fetch_contact_transcript(contact_id: int) -> str:
+    """UF транскрипта с контакта. Звонки часто висят на CONTACT, скилл читает лид."""
+    return fetch_contact_meta(int(contact_id)).get("transcript") or ""
 
 
 def resolve_transcript(lead: dict, contact_id) -> tuple[str, str]:
@@ -436,6 +467,12 @@ def resolve_transcript(lead: dict, contact_id) -> tuple[str, str]:
 def collect_lead(lead: dict, groups: list[str]) -> dict:
     lid = int(lead["ID"])
     contact_id = lead.get("CONTACT_ID")
+    contact_meta = None
+    if contact_id:
+        try:
+            contact_meta = fetch_contact_meta(int(contact_id))
+        except BitrixError as exc:
+            log.warning("contact meta fail CONTACT#%s: %s", contact_id, exc)
     calls = fetch_calls("LEAD", lid)
     if contact_id:
         extra = fetch_calls("CONTACT", int(contact_id))
@@ -458,6 +495,7 @@ def collect_lead(lead: dict, groups: list[str]) -> dict:
         "status_id": lead.get("STATUS_ID"),
         "assigned_by_id": lead.get("ASSIGNED_BY_ID"),
         "contact_id": contact_id,
+        "contact_meta": contact_meta,
         "is_return_customer": lead.get("IS_RETURN_CUSTOMER"),
         "phone": lead.get("PHONE") or [],
         "title": lead.get("TITLE") or "",
@@ -600,6 +638,7 @@ def run_fetch(
 ) -> str:
     started = datetime.now(MSK)
     t0 = started.timestamp()
+    _contact_meta_cache.clear()
 
     report_day = resolve_report_date(started, report_date_raw)
     log.info(
@@ -630,9 +669,10 @@ def run_fetch(
         rec = collect_lead(lead, group_map.get(lid, []))
         collected.append(rec)
         exist = rec["exist_check"]
+        svc = (rec.get("contact_meta") or {}).get("is_service")
         log.info(
             "лид %s [%s/%s] groups=%s calls=%s chats=%s tl_calls=%s tl_chats=%s "
-            "uf=%s src=%s gap=%s comm=%s",
+            "uf=%s src=%s gap=%s comm=%s service=%s",
             lid,
             i,
             len(leads),
@@ -645,6 +685,7 @@ def run_fetch(
             rec.get("transcript_source") or "empty",
             int(bool(rec.get("uf_gap"))),
             int(exist["has_communication"]),
+            int(bool(svc)),
         )
 
     with_long = sum(
