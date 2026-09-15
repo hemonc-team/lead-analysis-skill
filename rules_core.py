@@ -11,6 +11,14 @@ from typing import Any
 CLOSED_STATUSES = frozenset({"CONVERTED", "JUNK", "4", "7", "20"})
 MIN_CALL_DURATION = 15
 
+# Сервисные контакты-агрегаторы (ПроДокторов и аналоги): один номер — разные пациенты.
+SERVICE_CONTACT_MARKERS = (
+    "продоктор",
+    "номер не пац",
+    "не пациент",
+    "сервис про",
+)
+
 UF_NEXT = "UF_CRM_1599826765930"
 UF_TRANSCRIPT = "UF_CRM_GPT_TRANSCRIPT"
 UF_TEGI = "UF_CRM_1706806189"
@@ -49,6 +57,35 @@ def enum_label(enums: dict, field: str, raw: Any) -> str:
 
 def status_name(catalogs: dict, status_id: str | int | None) -> str:
     return (catalogs.get("statuses") or {}).get(str(status_id or ""), "")
+
+
+def contact_label(name: str | None, second_name: str | None, last_name: str | None) -> str:
+    parts = [p.strip() for p in (name, second_name, last_name) if p and str(p).strip()]
+    return " ".join(parts)
+
+
+def is_service_contact(
+    name: str | None = None,
+    second_name: str | None = None,
+    last_name: str | None = None,
+    contact_meta: dict | None = None,
+) -> tuple[bool, str]:
+    """Контакт-агрегатор (ПроДокторов): перезвон на номер лида бессмысленен."""
+    if contact_meta:
+        if contact_meta.get("is_service"):
+            return True, str(contact_meta.get("label") or "сервисный номер")
+        name = contact_meta.get("name")
+        second_name = contact_meta.get("second_name")
+        last_name = contact_meta.get("last_name")
+    blob = contact_label(name, second_name, last_name).lower().replace("ё", "е")
+    if not blob:
+        return False, ""
+    for marker in SERVICE_CONTACT_MARKERS:
+        if marker in blob:
+            if "продоктор" in blob:
+                return True, "ПроДокторов"
+            return True, "сервисный номер"
+    return False, ""
 
 
 def phone_is_russian(phones: Any) -> bool:
@@ -108,6 +145,14 @@ def check_r02(lead: dict, catalogs: dict) -> dict[str, Any]:
     status_id = str(lead.get("status_id") or lead.get("fields", {}).get("STATUS_ID") or "")
     if status_id in CLOSED_STATUSES:
         return {"applies": False, "ok": True, "detail": "закрыт — R02 не применяется"}
+
+    svc, svc_label = is_service_contact(contact_meta=lead.get("contact_meta"))
+    if svc:
+        return {
+            "applies": False,
+            "ok": True,
+            "detail": f"сервисный номер ({svc_label}) — R02 не применяется",
+        }
 
     active_request = "B" in groups or "C" in groups
     if not active_request:
@@ -244,12 +289,19 @@ def compact_lead_for_review(lead: dict, catalogs: dict, structural: dict) -> dic
     """Минимальный пакет для LLM — без дублирования сырого JSON."""
     fields = lead.get("fields") or {}
     transcript = lead.get("transcript") or fields.get(UF_TRANSCRIPT) or ""
+    contact_meta = lead.get("contact_meta") or {}
+    svc = structural.get("service_contact") or {}
     return {
         "id": lead["id"],
         "title": (lead.get("title") or "")[:120],
         "groups": lead.get("groups") or [],
         "operator_id": lead.get("assigned_by_id"),
         "is_return_customer": lead.get("is_return_customer") == "Y",
+        "contact": {
+            "is_service": bool(svc.get("is_service")),
+            "label": svc.get("label") or None,
+            "warning": svc.get("human"),
+        } if svc.get("is_service") else None,
         "structural": structural,
         "fields": fields_snapshot(lead, catalogs),
         "exist_check": {
@@ -310,13 +362,29 @@ def auto_classification(tier: str, lead: dict, structural: dict) -> str:
     return "needs_llm"
 
 
+def service_contact_check(lead: dict) -> dict[str, Any]:
+    svc, label = is_service_contact(contact_meta=lead.get("contact_meta"))
+    if not svc:
+        return {"is_service": False}
+    return {
+        "is_service": True,
+        "label": label,
+        "human": (
+            f"номер агрегатора {label}: перезвон на номер лида невозможен, "
+            "с одного номера звонят разные пациенты — не использовать историю контакта"
+        ),
+    }
+
+
 def structural_checks(lead: dict, catalogs: dict) -> dict[str, Any]:
     r02 = check_r02(lead, catalogs)
     r06 = check_r06(lead, catalogs)
     missing = missing_crm_fields(lead)
+    svc = service_contact_check(lead)
     return {
         "r02": r02,
         "r06": r06,
+        "service_contact": svc,
         "f03_risk": check_f03_risk(lead, catalogs),
         "uf_gap": bool(lead.get("uf_gap")),
         "missing_fields": missing,
@@ -324,4 +392,5 @@ def structural_checks(lead: dict, catalogs: dict) -> dict[str, Any]:
         "flag_e": bool(r06.get("flag_e")),
         "r02_human": r02.get("detail") if r02.get("flag_c") else None,
         "r06_human": "; ".join(r06.get("notes") or []) or None,
+        "r08_human": svc.get("human") if svc.get("is_service") else None,
     }
