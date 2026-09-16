@@ -21,7 +21,13 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from rules_core import auto_classification, compact_lead_for_review, decide_auto_tier, structural_checks
+from rules_core import (
+    auto_classification,
+    build_auto_crm_updates,
+    compact_lead_for_review,
+    decide_auto_tier,
+    structural_checks,
+)
 
 log = logging.getLogger("lead_analysis_triage")
 MSK = ZoneInfo("Europe/Moscow")
@@ -46,12 +52,16 @@ def run_triage(in_dir: Path, review_size: int) -> str:
     auto_lines: list[dict] = []
     review_leads: list[dict] = []
     structural_by_id: dict[str, dict] = {}
+    crm_auto_by_id: dict[str, dict] = {}
     tier_counts: dict[str, int] = {}
 
     for lead in leads:
         lid = int(lead["id"])
         structural = structural_checks(lead, catalogs)
         structural_by_id[str(lid)] = structural
+        auto_crm = build_auto_crm_updates(lead)
+        if auto_crm:
+            crm_auto_by_id[str(lid)] = auto_crm
         tier = decide_auto_tier(lead, catalogs, structural)
         tier_counts[tier] = tier_counts.get(tier, 0) + 1
 
@@ -73,6 +83,8 @@ def run_triage(in_dir: Path, review_size: int) -> str:
                 "r06_human": structural.get("r06_human"),
             },
             "fields": compact_lead_for_review(lead, catalogs, structural)["fields"],
+            "crm_updates": auto_crm or {},
+            "crm_updates_auto": auto_crm or {},
         })
 
     review_dir = in_dir / "review"
@@ -117,9 +129,12 @@ def run_triage(in_dir: Path, review_size: int) -> str:
         "review_batches": len(review_paths),
         "review_batch_size": review_size,
         "structural_by_id": structural_by_id,
+        "crm_auto_by_id": crm_auto_by_id,
+        "crm_auto_count": len(crm_auto_by_id),
         "token_note": (
             "Агент: читать review/review_NN.json по одному; после каждого файла дописать "
-            "judgements.jsonl; batch_*.json и SKILL целиком повторно не открывать."
+            "judgements.jsonl; batch_*.json и SKILL целиком повторно не открывать. "
+            "CRM пишет scripts/deliver_report.py (не руками crm.lead.update)."
         ),
     }
     (in_dir / "triage.json").write_text(
