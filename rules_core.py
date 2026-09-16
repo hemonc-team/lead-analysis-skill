@@ -26,10 +26,41 @@ UF_VARIACIA = "UF_CRM_1768816592560"
 UF_DRUG = "UF_CRM_1748956354216"
 UF_STATUS_DET = "UF_CRM_1747754997445"
 UF_TASK = "UF_CRM_1747750972275"
+UF_RECOMMEND = "UF_CRM_1711919555"  # Кто рекомендовал (категория)
+UF_RECOMMEND_COMMENT = "UF_CRM_1711919472"
 UF_LINK_1C = "UF_CRM_1732558654060"
 UF_WAITLIST = "UF_CRM_1761919557442"
 
-CRM_WRITE_FIELDS = (UF_TEGI, UF_VARIACIA, UF_DRUG, UF_STATUS_DET, UF_TASK)
+CRM_WRITE_FIELDS = (
+    UF_TEGI,
+    UF_VARIACIA,
+    UF_DRUG,
+    UF_STATUS_DET,
+    UF_TASK,
+    UF_RECOMMEND,
+    UF_RECOMMEND_COMMENT,
+)
+
+# F04: однозначный SOURCE_ID → enum «Кто рекомендовал» (только если поле пусто).
+# CALL / WEBFORM / RC_GENERATOR / BOOKING — не выводить только из источника.
+SOURCE_TO_RECOMMEND: dict[str, str] = {
+    "13": "484",  # Instagram hemonc_ru → Интернет. Наши соцсети
+    "21": "484",  # VK
+    "18": "484",  # Telegram бот/канал
+    "17": "484",
+    "25": "484",
+    "14": "476",  # WhatsApp Ассистент А. Аболмасова → Ассистанс
+    "REPEAT_SALE": "472",  # Повторное обращение
+    "UC_9CZZWB": "490",  # запись по запросу врача → Коллега
+}
+RECOMMEND_COMMENT_BY_SOURCE: dict[str, str] = {
+    "13": "Instagram",
+    "21": "VK",
+    "18": "Telegram",
+    "17": "Telegram",
+    "25": "Telegram",
+    "14": "WhatsApp ассистент",
+}
 
 BOOKING_1C = "e1cib/data/Документ.ОказаниеУслуг"
 WAITLIST_1C = "e1cib/data/РегистрСведений.ЛистОжидания"
@@ -215,7 +246,66 @@ def missing_crm_fields(lead: dict) -> list[str]:
         missing.append("статус_детальный")
     if uf_empty(fields.get(UF_TASK)) and str(lead.get("status_id") or "") not in CLOSED_STATUSES:
         missing.append("задача")
+    # кто_рекомендовал НЕ в missing_fields: иначе почти все лиды → needs_llm.
+    # F04 закрывается детерминированно (SOURCE_ID) + LLM crm_updates.
     return missing
+
+
+def lead_source_id(lead: dict) -> str:
+    fields = lead.get("fields") or {}
+    return str(fields.get("SOURCE_ID") or lead.get("source_id") or "").strip()
+
+
+def recommend_enum_from_source(source_id: str) -> str | None:
+    """Однозначный маппинг SOURCE_ID → enum F04. Иначе None."""
+    sid = (source_id or "").strip()
+    if not sid:
+        return None
+    if sid in SOURCE_TO_RECOMMEND:
+        return SOURCE_TO_RECOMMEND[sid]
+    if sid.startswith("WZaf84f452"):
+        return "484"
+    return None
+
+
+def suggest_recommend_update(lead: dict) -> dict[str, str]:
+    """F04 из SOURCE_ID, только если «Кто рекомендовал» пусто.
+
+    Разговорный F04 (спросили — не назвал → 474 и т.п.) — только через LLM crm_updates.
+    """
+    fields = lead.get("fields") or {}
+    if not uf_empty(fields.get(UF_RECOMMEND)):
+        return {}
+    sid = lead_source_id(lead)
+    enum_id = recommend_enum_from_source(sid)
+    if not enum_id:
+        return {}
+    out: dict[str, str] = {UF_RECOMMEND: enum_id}
+    if uf_empty(fields.get(UF_RECOMMEND_COMMENT)):
+        comment = RECOMMEND_COMMENT_BY_SOURCE.get(sid)
+        if comment:
+            out[UF_RECOMMEND_COMMENT] = comment
+        elif sid.startswith("WZaf84f452"):
+            out[UF_RECOMMEND_COMMENT] = "Telegram"
+    return out
+
+
+def merge_crm_updates(*parts: dict | None) -> dict[str, str]:
+    """Позже переданные части перекрывают ранние (LLM > auto)."""
+    merged: dict[str, str] = {}
+    for part in parts:
+        if not part:
+            continue
+        for k, v in part.items():
+            if v is None or str(v).strip() == "":
+                continue
+            merged[str(k)] = v if not isinstance(v, list) else (v[0] if v else "")
+    return merged
+
+
+def build_auto_crm_updates(lead: dict) -> dict[str, str]:
+    """Детерминированные CRM-апдейты без LLM (сейчас — F04 из SOURCE_ID)."""
+    return suggest_recommend_update(lead)
 
 
 def has_booking_1c(lead: dict) -> bool:
@@ -275,10 +365,14 @@ def fields_snapshot(lead: dict, catalogs: dict) -> dict[str, str]:
     enums = catalogs.get("enums") or {}
     return {
         "стадия": status_name(catalogs, lead.get("status_id")),
+        "source_id": lead_source_id(lead),
+        "source_description": str(fields.get("SOURCE_DESCRIPTION") or "").strip()[:120],
         "теги_кц": enum_label(enums, UF_TEGI, fields.get(UF_TEGI)),
         "вариация": enum_label(enums, UF_VARIACIA, fields.get(UF_VARIACIA)),
         "препарат": enum_label(enums, UF_DRUG, fields.get(UF_DRUG)),
         "статус_детальный": enum_label(enums, UF_STATUS_DET, fields.get(UF_STATUS_DET)),
+        "кто_рекомендовал": enum_label(enums, UF_RECOMMEND, fields.get(UF_RECOMMEND)),
+        "кто_рекомендовал_коммент": str(fields.get(UF_RECOMMEND_COMMENT) or "").strip()[:120],
         "задача": str(fields.get(UF_TASK) or "").strip(),
         "след_контакт": str(fields.get(UF_NEXT) or "").strip()[:16],
         "запись_1с": "да" if has_booking_1c(lead) else "нет",
@@ -289,8 +383,8 @@ def compact_lead_for_review(lead: dict, catalogs: dict, structural: dict) -> dic
     """Минимальный пакет для LLM — без дублирования сырого JSON."""
     fields = lead.get("fields") or {}
     transcript = lead.get("transcript") or fields.get(UF_TRANSCRIPT) or ""
-    contact_meta = lead.get("contact_meta") or {}
     svc = structural.get("service_contact") or {}
+    auto_crm = build_auto_crm_updates(lead)
     return {
         "id": lead["id"],
         "title": (lead.get("title") or "")[:120],
@@ -304,6 +398,7 @@ def compact_lead_for_review(lead: dict, catalogs: dict, structural: dict) -> dic
         } if svc.get("is_service") else None,
         "structural": structural,
         "fields": fields_snapshot(lead, catalogs),
+        "crm_updates_auto": auto_crm or None,
         "exist_check": {
             "has_communication": (lead.get("exist_check") or {}).get("has_communication"),
             "only_timeline": (
