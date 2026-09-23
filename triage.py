@@ -52,6 +52,7 @@ def run_triage(in_dir: Path, review_size: int) -> str:
     auto_lines: list[dict] = []
     review_leads: list[dict] = []
     structural_by_id: dict[str, dict] = {}
+    operator_by_id: dict[str, str] = {}
     crm_auto_by_id: dict[str, dict] = {}
     tier_counts: dict[str, int] = {}
 
@@ -59,6 +60,9 @@ def run_triage(in_dir: Path, review_size: int) -> str:
         lid = int(lead["id"])
         structural = structural_checks(lead, catalogs)
         structural_by_id[str(lid)] = structural
+        assigned = lead.get("assigned_by_id")
+        if assigned is not None and str(assigned).strip() and str(assigned) not in ("None", "0"):
+            operator_by_id[str(lid)] = str(assigned)
         auto_crm = build_auto_crm_updates(lead)
         if auto_crm:
             crm_auto_by_id[str(lid)] = auto_crm
@@ -129,6 +133,7 @@ def run_triage(in_dir: Path, review_size: int) -> str:
         "review_batches": len(review_paths),
         "review_batch_size": review_size,
         "structural_by_id": structural_by_id,
+        "operator_by_id": operator_by_id,
         "crm_auto_by_id": crm_auto_by_id,
         "crm_auto_count": len(crm_auto_by_id),
         "token_note": (

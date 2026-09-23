@@ -100,7 +100,66 @@ def month_name_ru(d: str) -> str:
     return f"{dt.day} {months[dt.month]}"
 
 
-def build_report(triage: dict, auto: list[dict], judgements: list[dict], crm_stats: dict) -> str:
+def _norm_operator_id(raw) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text in ("None", "0", "false", "False"):
+        return None
+    return text
+
+
+def load_operator_by_id(run_dir: Path, triage: dict | None = None) -> dict[str, str]:
+    """id лида → ASSIGNED_BY_ID. Judgements часто без operator_id — берём из triage/review/auto."""
+    ops: dict[str, str] = {}
+    for sid, oid in ((triage or {}).get("operator_by_id") or {}).items():
+        norm = _norm_operator_id(oid)
+        if norm:
+            ops[str(sid)] = norm
+    for row in load_jsonl(run_dir / "auto_results.jsonl"):
+        norm = _norm_operator_id(row.get("operator_id"))
+        if norm:
+            ops[str(row["id"])] = norm
+    review_dir = run_dir / "review"
+    if review_dir.is_dir():
+        for path in sorted(review_dir.glob("review_*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for lead in data.get("leads") or []:
+                lid = lead.get("id")
+                if lid is None:
+                    continue
+                norm = _norm_operator_id(lead.get("operator_id"))
+                if norm:
+                    ops[str(lid)] = norm
+    return ops
+
+
+def enrich_operator_ids(rows: list[dict], operator_by_id: dict[str, str]) -> None:
+    for row in rows:
+        if _norm_operator_id(row.get("operator_id")):
+            continue
+        oid = operator_by_id.get(str(row.get("id", "")))
+        if oid:
+            row["operator_id"] = oid
+
+
+def operator_display_name(oid, users: dict) -> str:
+    norm = _norm_operator_id(oid)
+    if not norm:
+        return "оператор"
+    return (users or {}).get(norm) or f"оператор {norm}"
+
+
+def build_report(
+    triage: dict,
+    auto: list[dict],
+    judgements: list[dict],
+    crm_stats: dict,
+    users: dict | None = None,
+) -> str:
     c = triage["counts"]
     rd = triage["report_date"]
     date_h = month_name_ru(rd)
@@ -123,16 +182,14 @@ def build_report(triage: dict, auto: list[dict], judgements: list[dict], crm_sta
     ]
     actions = [r for r in judgements if r.get("in_action_list")]
 
-    users = {}
-    try:
-        cat_path = Path(triage.get("_catalogs_path") or "")
-        if cat_path.is_file():
-            users = json.loads(cat_path.read_text(encoding="utf-8")).get("users") or {}
-    except Exception:
-        pass
-
-    def op_name(oid: str) -> str:
-        return users.get(str(oid), f"оператор {oid}" if oid else "оператор")
+    if users is None:
+        users = {}
+        try:
+            cat_path = Path(triage.get("_catalogs_path") or "")
+            if cat_path.is_file():
+                users = json.loads(cat_path.read_text(encoding="utf-8")).get("users") or {}
+        except Exception:
+            pass
 
     lines = [
         f"📊 Проверка обращений за {date_h}",
@@ -175,7 +232,7 @@ def build_report(triage: dict, auto: list[dict], judgements: list[dict], crm_sta
         lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━", "ЧТО СДЕЛАТЬ СЕГОДНЯ", ""]
         for r in actions:
             lid = r["id"]
-            op = op_name(r.get("operator_id", ""))
+            op = operator_display_name(r.get("operator_id"), users)
             lines += [
                 f"⚠️ [URL={PORTAL}/crm/lead/details/{lid}/]#{lid}[/URL] — {op}",
                 f"Что хотел пациент: {r.get('patient_wanted', '')}",
@@ -325,7 +382,7 @@ def send_chat(message: str) -> None:
 def send_bot_buttons(actions: list[dict], users: dict) -> None:
     for r in actions:
         lid = r["id"]
-        op = users.get(str(r.get("operator_id", "")), "")
+        op = operator_display_name(r.get("operator_id"), users)
         short = (r.get("action") or r.get("patient_wanted") or "")[:120]
         msg = f"⚠️ #{lid} — {op}. {short}"
         bx(
@@ -478,9 +535,14 @@ def main() -> int:
     catalogs = {}
     if (run_dir / "catalogs.json").exists():
         catalogs = json.loads((run_dir / "catalogs.json").read_text(encoding="utf-8"))
+    users = catalogs.get("users") or {}
 
     auto = load_jsonl(run_dir / "auto_results.jsonl")
     judgements = load_jsonl(run_dir / "judgements.jsonl")
+    # Judgements по схеме SKILL часто без operator_id — восстанавливаем из triage/review/auto.
+    operator_by_id = load_operator_by_id(run_dir, triage)
+    enrich_operator_ids(auto, operator_by_id)
+    enrich_operator_ids(judgements, operator_by_id)
     crm_auto_by_id = triage.get("crm_auto_by_id") or {}
 
     struct = triage.get("structural_by_id") or {}
@@ -540,7 +602,7 @@ def main() -> int:
         crm_stats.get("recommend_added") or 0
     )
 
-    report = build_report(triage, auto, judgements, crm_stats)
+    report = build_report(triage, auto, judgements, crm_stats, users=users)
     (run_dir / "report.txt").write_text(report, encoding="utf-8")
     (run_dir / "crm_stats.json").write_text(
         json.dumps(crm_stats, ensure_ascii=False, indent=2),
@@ -552,7 +614,7 @@ def main() -> int:
     if not dry:
         send_chat(report)
         if actions:
-            send_bot_buttons(actions, catalogs.get("users") or {})
+            send_bot_buttons(actions, users)
         try:
             csv_n = append_csv(all_rows, triage["report_date"])
         except Exception as e:  # noqa: BLE001

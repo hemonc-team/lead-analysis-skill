@@ -80,6 +80,7 @@ python3 triage.py --in-dir .run/latest
   "id": 92460,
   "classification": "loss|action|ok|info|gap_only",
   "emoji": "🔴|⚠️|✅|ℹ️|🎧",
+  "operator_id": "12345",
   "patient_wanted": "…",
   "what_happened": "…",
   "why_important": "…",
@@ -90,6 +91,9 @@ python3 triage.py --in-dir .run/latest
   "in_action_list": true
 }
 ```
+
+`operator_id` = `assigned_by_id` из review-пакета (ответственный за лид). Если не указать —
+`deliver_report.py` подставит из `triage.operator_by_id` / review.
 
 `in_action_list=true` только для 🔴 и ⚠️ (карточка в «Что сделать сегодня»).
 
