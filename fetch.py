@@ -372,21 +372,41 @@ def fetch_timeline(lead_id: int) -> dict:
     return {"calls": slim_calls, "chats": slim_chats}
 
 
-def long_success_calls(calls: list[dict]) -> list[dict]:
-    """Состоявшиеся звонки ≥ MIN_CALL_DURATION секунд."""
+def call_on_report_day(call: dict, report_day: date) -> bool:
+    """Звонок в календарный день отчёта (МСК). Дата REST — ISO, обычно +03:00."""
+    raw = str(call.get("date") or "").strip()
+    if len(raw) < 10:
+        return False
+    return raw[:10] == report_day.isoformat()
+
+
+def long_success_calls(
+    calls: list[dict],
+    report_day: date | None = None,
+) -> list[dict]:
+    """Состоявшиеся звонки ≥ MIN_CALL_DURATION секунд.
+
+    Если задан report_day — только звонки этого календарного дня (день отчёта).
+    """
     out = []
     for c in calls:
         if int(c.get("duration") or 0) < MIN_CALL_DURATION:
             continue
         if str(c.get("failed_code") or "") != "200":
             continue
+        if report_day is not None and not call_on_report_day(c, report_day):
+            continue
         out.append(c)
     return out
 
 
-def uf_gap_for_lead(calls: list[dict], uf_text: str) -> dict:
-    """Явный UF-gap (#24604): длинный звонок есть, текста в поле нет."""
-    long_calls = long_success_calls(calls)
+def uf_gap_for_lead(calls: list[dict], uf_text: str, report_day: date) -> dict:
+    """UF-gap дня отчёта: длинный дозвон в report_date, текста в UF нет.
+
+    Исторические звонки на карточке в метрику и 🎧 не входят.
+    """
+    long_all = long_success_calls(calls)
+    long_calls = long_success_calls(calls, report_day)
     has_uf = bool((uf_text or "").strip())
     gap = bool(long_calls) and not has_uf
     latest = None
@@ -400,10 +420,13 @@ def uf_gap_for_lead(calls: list[dict], uf_text: str) -> dict:
     return {
         "uf_gap": gap,
         "long_calls": len(long_calls),
+        "long_calls_all": len(long_all),
         "has_uf": has_uf,
         "latest_long_call_at": latest,
+        "report_date": report_day.isoformat(),
         "report_mark": (
-            f"Разговор {latest or 'дата?'} не расшифрован — по содержанию не судить"
+            f"Разговор {latest or 'дата?'} за {report_day.isoformat()} "
+            f"не расшифрован — по содержанию не судить"
             if gap
             else None
         ),
@@ -469,7 +492,7 @@ def resolve_transcript(lead: dict, contact_id) -> tuple[str, str]:
     return "", "empty"
 
 
-def collect_lead(lead: dict, groups: list[str]) -> dict:
+def collect_lead(lead: dict, groups: list[str], report_day: date) -> dict:
     lid = int(lead["ID"])
     contact_id = lead.get("CONTACT_ID")
     contact_meta = None
@@ -490,7 +513,7 @@ def collect_lead(lead: dict, groups: list[str]) -> dict:
     chats = fetch_chats(lid)
     timeline = fetch_timeline(lid)
     uf_text, transcript_source = resolve_transcript(lead, contact_id)
-    gap = uf_gap_for_lead(calls, uf_text)
+    gap = uf_gap_for_lead(calls, uf_text, report_day)
     vox_empty = len(calls) == 0 or all(not c.get("transcript_id") for c in calls)
     ol_empty = not chats
     exist_required = vox_empty or ol_empty
@@ -671,7 +694,7 @@ def run_fetch(
     collected = []
     for i, lead in enumerate(leads, 1):
         lid = int(lead["ID"])
-        rec = collect_lead(lead, group_map.get(lid, []))
+        rec = collect_lead(lead, group_map.get(lid, []), report_day)
         collected.append(rec)
         exist = rec["exist_check"]
         svc = (rec.get("contact_meta") or {}).get("is_service")
@@ -703,6 +726,8 @@ def run_fetch(
         "leads_uf_gap": with_gap,
         "uf_gap_pct": gap_pct,
         "min_duration_sec": MIN_CALL_DURATION,
+        "scope": "report_date",
+        "report_date": report_day.isoformat(),
     }
     log.info("UF-gap: long_call=%s gap=%s (%.1f%%)", with_long, with_gap, gap_pct)
 
