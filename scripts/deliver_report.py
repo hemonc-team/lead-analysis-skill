@@ -24,9 +24,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from rules_core import (  # noqa: E402
+    FOR_WHOM_LABELS,
+    UF_FOR_WHOM,
     UF_RECOMMEND,
     UF_RECOMMEND_COMMENT,
     UF_TEGI,
+    for_whom_enum,
     merge_crm_updates,
     uf_empty,
 )
@@ -47,6 +50,14 @@ NO_OVERWRITE = {
     "UF_CRM_1747750972275",
     UF_RECOMMEND,
     UF_RECOMMEND_COMMENT,
+    UF_FOR_WHOM,
+}
+
+# Поля, по которым в отчёте считаем «было / стало / добавил»: префикс ключа crm_stats → UF.
+TRACKED_FIELDS = {
+    "tags": UF_TEGI,
+    "recommend": UF_RECOMMEND,
+    "for_whom": UF_FOR_WHOM,
 }
 
 
@@ -226,6 +237,11 @@ def build_report(
             f"стало {crm_stats.get('recommend_after', 0)} — "
             f"добавил {crm_stats.get('recommend_added', 0)}"
         ),
+        (
+            f"• Для кого ищут помощь: было {crm_stats.get('for_whom_before', 0)} из {c['unique']}, "
+            f"стало {crm_stats.get('for_whom_after', 0)} — "
+            f"добавил {crm_stats.get('for_whom_added', 0)}"
+        ),
     ]
 
     if actions:
@@ -288,13 +304,29 @@ def collect_pending_updates(
         else:
             by_id[sid] = merge_crm_updates(auto_u, by_id[sid])
 
+    by_id = {sid: normalize_proposed(fields) for sid, fields in by_id.items()}
     return {sid: fields for sid, fields in by_id.items() if fields}
+
+
+def normalize_proposed(proposed: dict[str, str]) -> dict[str, str]:
+    """Привести значения к виду для crm.lead.update; невалидные — выкинуть.
+
+    F05 «Для кого»: только enum 2656/2658 (подпись → ID); «Не выбрано»/мусор не пишем.
+    """
+    out: dict[str, str] = {}
+    for key, val in proposed.items():
+        if key == UF_FOR_WHOM:
+            val = for_whom_enum(val)
+            if val is None:
+                continue
+        out[key] = val
+    return out
 
 
 def filter_writable(lead: dict, proposed: dict[str, str]) -> dict[str, str]:
     """Не перезаписывать уже заполненные UF."""
     out: dict[str, str] = {}
-    for key, val in proposed.items():
+    for key, val in normalize_proposed(proposed).items():
         if key in NO_OVERWRITE and not uf_empty(lead.get(key)):
             continue
         if uf_empty(val):
@@ -303,37 +335,35 @@ def filter_writable(lead: dict, proposed: dict[str, str]) -> dict[str, str]:
     return out
 
 
+def for_whom_csv_label(crm: dict, fields: dict) -> str:
+    """Подпись F05 для CSV: из crm_updates (ID → подпись), иначе из снимка карточки."""
+    enum_id = for_whom_enum(crm.get(UF_FOR_WHOM))
+    if enum_id:
+        return FOR_WHOM_LABELS[enum_id]
+    return str(fields.get("для_кого") or "")
+
+
 def apply_crm_updates(pending: dict[str, dict[str, str]], *, dry_run: bool) -> dict:
-    stats = {
-        "updated": 0,
-        "skipped_empty": 0,
-        "tags_before": 0,
-        "tags_after": 0,
-        "tags_added": 0,
-        "recommend_before": 0,
-        "recommend_after": 0,
-        "recommend_added": 0,
-        "errors": [],
-        "would_update": [],
-    }
+    stats: dict = {"updated": 0, "skipped_empty": 0, "errors": [], "would_update": []}
+    for prefix in TRACKED_FIELDS:
+        stats[f"{prefix}_before"] = 0
+        stats[f"{prefix}_after"] = 0
+        stats[f"{prefix}_added"] = 0
 
     for sid, proposed in pending.items():
         try:
             lead = bx("crm.lead.get.json", {"id": sid})["result"]
-            had_tag = not uf_empty(lead.get(UF_TEGI))
-            had_rec = not uf_empty(lead.get(UF_RECOMMEND))
-            if had_tag:
-                stats["tags_before"] += 1
-            if had_rec:
-                stats["recommend_before"] += 1
+            had = {p: not uf_empty(lead.get(uf)) for p, uf in TRACKED_FIELDS.items()}
+            for p, was in had.items():
+                if was:
+                    stats[f"{p}_before"] += 1
 
             fields = filter_writable(lead, proposed)
             if not fields:
                 stats["skipped_empty"] += 1
-                if had_tag:
-                    stats["tags_after"] += 1
-                if had_rec:
-                    stats["recommend_after"] += 1
+                for p, was in had.items():
+                    if was:
+                        stats[f"{p}_after"] += 1
                 continue
 
             if dry_run:
@@ -343,14 +373,11 @@ def apply_crm_updates(pending: dict[str, dict[str, str]], *, dry_run: bool) -> d
                 bx("crm.lead.update.json", {"id": sid, "fields": fields})
                 stats["updated"] += 1
 
-            if UF_TEGI in fields and not had_tag:
-                stats["tags_added"] += 1
-            if UF_RECOMMEND in fields and not had_rec:
-                stats["recommend_added"] += 1
-            if had_tag or UF_TEGI in fields:
-                stats["tags_after"] += 1
-            if had_rec or UF_RECOMMEND in fields:
-                stats["recommend_after"] += 1
+            for p, uf in TRACKED_FIELDS.items():
+                if uf in fields and not had[p]:
+                    stats[f"{p}_added"] += 1
+                if had[p] or uf in fields:
+                    stats[f"{p}_after"] += 1
         except Exception as e:  # noqa: BLE001
             stats["errors"].append(f"#{sid}: {e}")
             log.warning("CRM update #%s: %s", sid, e)
@@ -362,17 +389,16 @@ def baseline_field_counts(all_rows: list[dict]) -> dict[str, int]:
     """Сколько полей уже заполнено до записи (по снимку triage/judgements)."""
     tags = 0
     rec = 0
+    for_whom = 0
     for r in all_rows:
         fields = r.get("fields") or {}
         if str(fields.get("теги_кц") or "").strip():
             tags += 1
         if str(fields.get("кто_рекомендовал") or "").strip():
             rec += 1
-        # auto rows may not have label snapshot for recommend if old triage
-        crm = r.get("crm_updates") or {}
-        if UF_RECOMMEND in crm and not str(fields.get("кто_рекомендовал") or "").strip():
-            pass
-    return {"tags_before": tags, "recommend_before": rec}
+        if str(fields.get("для_кого") or "").strip():
+            for_whom += 1
+    return {"tags_before": tags, "recommend_before": rec, "for_whom_before": for_whom}
 
 
 def send_chat(message: str) -> None:
@@ -407,6 +433,18 @@ def send_bot_buttons(actions: list[dict], users: dict) -> None:
                 ),
             },
         )
+
+
+def migrate_csv_header(existing: str, header: str) -> str:
+    """Новые колонки дописываются в конец: старый заголовок-префикс → текущий.
+
+    Старые строки остаются короче (пустой хвост) — читатели CSV дополняют пустыми.
+    """
+    first, sep, rest = existing.partition("\n")
+    old = first.rstrip("\r")
+    if old != header and header.startswith(old + ","):
+        return header + sep + rest
+    return existing
 
 
 def append_csv(all_rows: list[dict], report_date: str) -> int:
@@ -461,11 +499,11 @@ def append_csv(all_rows: list[dict], report_date: str) -> int:
     header = (
         "дата,лид_id,ссылка,оператор,направление,классификация,флаг_C,флаг_E,"
         "тег_кц_AI,препарат_AI,статус_детальный_AI,задача_AI,кто_рекомендовал_AI,"
-        "согласие_с_оценкой"
+        "согласие_с_оценкой,для_кого_AI"
     )
     out = io.StringIO()
     if existing.strip():
-        out.write(existing.rstrip("\n") + "\n")
+        out.write(migrate_csv_header(existing, header).rstrip("\n") + "\n")
     elif not file_id:
         out.write(header + "\n")
 
@@ -497,6 +535,7 @@ def append_csv(all_rows: list[dict], report_date: str) -> int:
                     str(crm.get("UF_CRM_1747750972275", fields.get("задача", "")))[:200],
                     str(crm.get(UF_RECOMMEND, fields.get("кто_рекомендовал", ""))),
                     "",
+                    for_whom_csv_label(crm, fields),
                 ]
             )
             + "\n"
@@ -586,6 +625,10 @@ def main() -> int:
                 "recommend_after": baseline["recommend_before"]
                 + sum(1 for f in pending.values() if UF_RECOMMEND in f),
                 "recommend_added": sum(1 for f in pending.values() if UF_RECOMMEND in f),
+                "for_whom_before": baseline["for_whom_before"],
+                "for_whom_after": baseline["for_whom_before"]
+                + sum(1 for f in pending.values() if UF_FOR_WHOM in f),
+                "for_whom_added": sum(1 for f in pending.values() if UF_FOR_WHOM in f),
                 "errors": [str(e)],
                 "would_update": [
                     {"id": sid, "fields": fields} for sid, fields in pending.items()
@@ -600,6 +643,10 @@ def main() -> int:
     crm_stats["tags_after"] = baseline["tags_before"] + int(crm_stats.get("tags_added") or 0)
     crm_stats["recommend_after"] = baseline["recommend_before"] + int(
         crm_stats.get("recommend_added") or 0
+    )
+    crm_stats["for_whom_before"] = baseline["for_whom_before"]
+    crm_stats["for_whom_after"] = baseline["for_whom_before"] + int(
+        crm_stats.get("for_whom_added") or 0
     )
 
     report = build_report(triage, auto, judgements, crm_stats, users=users)
@@ -621,18 +668,20 @@ def main() -> int:
             log.warning("CSV Disk skip: %s", e)
             csv_n = 0
         log.info(
-            "live: CRM updated=%s recommend_added=%s CSV=%s chat=ok buttons=%s",
+            "live: CRM updated=%s recommend_added=%s for_whom_added=%s CSV=%s chat=ok buttons=%s",
             crm_stats["updated"],
             crm_stats.get("recommend_added"),
+            crm_stats.get("for_whom_added"),
             csv_n,
             len(actions),
         )
     else:
         log.info(
-            "dry-run: report → %s would_update=%s recommend_added≈%s",
+            "dry-run: report → %s would_update=%s recommend_added≈%s for_whom_added≈%s",
             run_dir / "report.txt",
             crm_stats.get("updated"),
             crm_stats.get("recommend_added"),
+            crm_stats.get("for_whom_added"),
         )
         for item in (crm_stats.get("would_update") or [])[:20]:
             log.info("  would #%s %s", item["id"], item["fields"])
@@ -640,7 +689,7 @@ def main() -> int:
     c = triage["counts"]
     log.info(
         "САМОПРОВЕРКА: date=%s total=%s auto=%s llm=%s openlines=%s mode=%s "
-        "CRM_updated=%s recommend_added=%s err=%s",
+        "CRM_updated=%s recommend_added=%s for_whom_added=%s err=%s",
         triage["report_date"],
         c["unique"],
         triage.get("auto_leads"),
@@ -649,6 +698,7 @@ def main() -> int:
         mode,
         crm_stats.get("updated"),
         crm_stats.get("recommend_added"),
+        crm_stats.get("for_whom_added"),
         crm_stats.get("errors"),
     )
     return 0 if not crm_stats.get("errors") else 1

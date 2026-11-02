@@ -28,6 +28,7 @@ UF_STATUS_DET = "UF_CRM_1747754997445"
 UF_TASK = "UF_CRM_1747750972275"
 UF_RECOMMEND = "UF_CRM_1711919555"  # Кто рекомендовал (категория)
 UF_RECOMMEND_COMMENT = "UF_CRM_1711919472"
+UF_FOR_WHOM = "UF_CRM_1793611825"  # Для кого ищете помощь (enum, single)
 UF_LINK_1C = "UF_CRM_1732558654060"
 UF_WAITLIST = "UF_CRM_1761919557442"
 
@@ -39,7 +40,17 @@ CRM_WRITE_FIELDS = (
     UF_TASK,
     UF_RECOMMEND,
     UF_RECOMMEND_COMMENT,
+    UF_FOR_WHOM,
 )
+
+# F05: «Для кого ищете помощь». Только из разговора (LLM crm_updates), не из SOURCE_ID.
+# Пусто в карточке = «Не выбрано»; сомнение → не писать.
+FOR_WHOM_SELF = "2656"
+FOR_WHOM_RELATIVE = "2658"
+FOR_WHOM_LABELS: dict[str, str] = {
+    FOR_WHOM_SELF: "Для себя",
+    FOR_WHOM_RELATIVE: "Для близкого",
+}
 
 # F04: однозначный SOURCE_ID → enum «Кто рекомендовал» (только если поле пусто).
 # CALL / WEBFORM / RC_GENERATOR / BOOKING — не выводить только из источника.
@@ -248,6 +259,7 @@ def missing_crm_fields(lead: dict) -> list[str]:
         missing.append("задача")
     # кто_рекомендовал НЕ в missing_fields: иначе почти все лиды → needs_llm.
     # F04 закрывается детерминированно (SOURCE_ID) + LLM crm_updates.
+    # для_кого (F05) тоже НЕ в missing_fields — только попутно в LLM-разборе.
     return missing
 
 
@@ -288,6 +300,26 @@ def suggest_recommend_update(lead: dict) -> dict[str, str]:
         elif sid.startswith("WZaf84f452"):
             out[UF_RECOMMEND_COMMENT] = "Telegram"
     return out
+
+
+def for_whom_enum(value: Any) -> str | None:
+    """Нормализовать значение F05 из crm_updates → enum ID (2656/2658) или None.
+
+    Принимает ID или подпись («Для себя» / «Для близкого»). «Не выбрано», пусто,
+    мусор → None: такое значение не пишем.
+    """
+    if isinstance(value, list):
+        value = value[0] if len(value) == 1 else None
+    if uf_empty(value):
+        return None
+    text = str(value).strip()
+    if text in FOR_WHOM_LABELS:
+        return text
+    norm = text.lower().replace("ё", "е")
+    for enum_id, label in FOR_WHOM_LABELS.items():
+        if norm == label.lower():
+            return enum_id
+    return None
 
 
 def merge_crm_updates(*parts: dict | None) -> dict[str, str]:
@@ -373,6 +405,7 @@ def fields_snapshot(lead: dict, catalogs: dict) -> dict[str, str]:
         "статус_детальный": enum_label(enums, UF_STATUS_DET, fields.get(UF_STATUS_DET)),
         "кто_рекомендовал": enum_label(enums, UF_RECOMMEND, fields.get(UF_RECOMMEND)),
         "кто_рекомендовал_коммент": str(fields.get(UF_RECOMMEND_COMMENT) or "").strip()[:120],
+        "для_кого": enum_label(enums, UF_FOR_WHOM, fields.get(UF_FOR_WHOM)),
         "задача": str(fields.get(UF_TASK) or "").strip(),
         "след_контакт": str(fields.get(UF_NEXT) or "").strip()[:16],
         "запись_1с": "да" if has_booking_1c(lead) else "нет",
